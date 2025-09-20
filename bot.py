@@ -33,13 +33,12 @@ from torch.backends import cudnn
 # ===============================
 # Configuración del modelo
 # ===============================
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("🖥️ Usando dispositivo:", DEVICE)
 
-if DEVICE == 'cuda':
-    cudnn.benchmark = True  # acelerar convoluciones con tamaños estables
+if DEVICE == "cuda":
+    cudnn.benchmark = True  # optimiza convoluciones
 else:
-    # Acelerar CPU usando más hilos (Colab suele tener 2 vCPU)
     try:
         torch.set_num_threads(max(1, (os.cpu_count() or 2)))
     except Exception:
@@ -49,7 +48,7 @@ MODEL_DIR = os.path.join("experiments", "pretrained_models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 MODEL_PATH = os.path.join(MODEL_DIR, "RealESRGAN_x4plus_anime_6B.pth")
-MODEL_URL  = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"
+MODEL_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"
 
 # Descargar modelo si no existe
 if not os.path.exists(MODEL_PATH):
@@ -60,12 +59,13 @@ if not os.path.exists(MODEL_PATH):
 # RRDBNet con 6 bloques (anime_6B)
 model_rrdb = RRDBNet(
     num_in_ch=3, num_out_ch=3, num_feat=64,
-    num_block=6,  # clave para anime_6B
+    num_block=6,  # anime_6B usa 6 bloques
     num_grow_ch=32, scale=4
 )
 
-# Tiles: GPU -> más grandes (menos overhead); CPU -> sin tiles (si hay RAM) para evitar coste de mosaico
-DEFAULT_TILE = 400 if DEVICE == 'cuda' else 0
+# Tiles iniciales: GPU -> grandes, CPU -> sin tiles
+DEFAULT_TILE = 400 if DEVICE == "cuda" else 0
+CURRENT_TILE = DEFAULT_TILE
 
 upscaler = RealESRGANer(
     scale=4,
@@ -74,33 +74,36 @@ upscaler = RealESRGANer(
     tile=DEFAULT_TILE,
     tile_pad=10,
     pre_pad=0,
-    half=(DEVICE == 'cuda'),
+    half=(DEVICE == "cuda"),
     device=DEVICE
 )
 
 def enhance_autotile(img, outscale=4):
-    """Intenta con el tile actual; si OOM, reduce automáticamente."""
-    # Secuencia de fallback de tiles
-    candidates = [upscaler.tile] if upscaler.tile else [0]
-    # Si falla, probamos valores más pequeños
+    """Prueba con varios valores de tile en caso de OOM."""
+    global CURRENT_TILE
+    candidates = [DEFAULT_TILE] if DEFAULT_TILE else [0]
     candidates += [300, 200, 120, 100, 60]
-    tried = set()
     last_err = None
     for t in candidates:
-        if t in tried: 
-            continue
-        tried.add(t)
-        upscaler.tile = t
         try:
-            return upscaler.enhance(img, outscale=outscale)
+            result, _ = RealESRGANer(
+                scale=4,
+                model_path=MODEL_PATH,
+                model=model_rrdb,
+                tile=t,
+                tile_pad=10,
+                pre_pad=0,
+                half=(DEVICE == "cuda"),
+                device=DEVICE
+            ).enhance(img, outscale=outscale)
+            CURRENT_TILE = t
+            return result
         except RuntimeError as e:
-            msg = str(e).lower()
-            last_err = e
-            # Si no es por memoria, no tiene sentido seguir intentando
-            if "out of memory" not in msg and "cuda" not in msg:
-                raise
-            print(f"⚠️ OOM con tile={t}, probando uno más pequeño...")
-    # Si llegamos aquí, no hubo forma
+            if "out of memory" in str(e).lower():
+                print(f"⚠️ OOM con tile={t}, probando más pequeño...")
+                last_err = e
+                continue
+            raise
     raise last_err if last_err else RuntimeError("Fallo de inferencia")
 
 # ===============================
@@ -121,7 +124,7 @@ async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await tg_file.download_to_drive(input_path)
         await update.message.reply_text(
-            f"⏳ Procesando en **{DEVICE.upper()}** (tile={upscaler.tile or 'full'})..."
+            f"⏳ Procesando en **{DEVICE.upper()}** (tile={CURRENT_TILE or 'full'})..."
         )
 
         img = cv2.imread(input_path, cv2.IMREAD_COLOR)
@@ -130,7 +133,7 @@ async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            result, _ = enhance_autotile(img, outscale=4)
+            result = enhance_autotile(img, outscale=4)
         except Exception as e:
             await update.message.reply_text(f"⚠️ Error en Real-ESRGAN:\n{str(e)}")
             return
@@ -143,7 +146,8 @@ async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         for p in (locals().get("input_path"), locals().get("output_path")):
             try:
-                if p and os.path.exists(p): os.remove(p)
+                if p and os.path.exists(p):
+                    os.remove(p)
             except Exception:
                 pass
 
