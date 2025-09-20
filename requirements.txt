@@ -1,0 +1,9 @@
+python-telegram-bot==20.3
+nest_asyncio
+torch
+torchvision
+opencv-python
+basicsr
+facexlib
+gfpgan
+realesrgan
